@@ -26,6 +26,7 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
 import data_utils
+import cells
 
 
 class Seq2SeqModel(object):
@@ -42,13 +43,13 @@ class Seq2SeqModel(object):
   and sampled softmax is described in Section 3 of the following paper.
     http://arxiv.org/abs/1412.2007
   """
-
   def __init__(self,
                source_vocab_size,
                target_vocab_size,
                buckets,
                size,
                num_layers,
+               num_gpus,
                max_gradient_norm,
                batch_size,
                learning_rate,
@@ -83,22 +84,26 @@ class Seq2SeqModel(object):
     self.source_vocab_size = source_vocab_size
     self.target_vocab_size = target_vocab_size
     self.buckets = buckets
+    self.cell_size = size
+    self.num_layers = num_layers 
+    self.num_gpus = num_gpus 
     self.batch_size = batch_size
     self.learning_rate = tf.Variable(
         float(learning_rate), trainable=False, dtype=dtype)
     self.learning_rate_decay_op = self.learning_rate.assign(
         self.learning_rate * learning_rate_decay_factor)
     self.global_step = tf.Variable(0, trainable=False)
+    self.dtype = dtype
 
     # If we use sampled softmax, we need an output projection.
-    output_projection = None
+    self.output_projection = None
     softmax_loss_function = None
     # Sampled softmax only makes sense if we sample less than vocabulary size.
     if num_samples > 0 and num_samples < self.target_vocab_size:
       w_t = tf.get_variable("proj_w", [self.target_vocab_size, size], dtype=dtype)
       w = tf.transpose(w_t)
       b = tf.get_variable("proj_b", [self.target_vocab_size], dtype=dtype)
-      output_projection = (w, b)
+      self.output_projection = (w, b)
 
       def sampled_loss(labels, inputs):
         labels = tf.reshape(labels, [-1, 1])
@@ -117,58 +122,6 @@ class Seq2SeqModel(object):
                 num_classes=self.target_vocab_size),
             dtype)
       softmax_loss_function = sampled_loss
-
-   # The seq2seq function: we use embedding for the input and attention.
-    def seq2seq_f(encoder_inputs, decoder_inputs, do_decode):
-      # Create the internal multi-layer cell for our RNN.
-      single_cell = tf.contrib.rnn.GRUCell(size)
-      if use_lstm:
-        single_cell = tf.contrib.rnn.BasicLSTMCell(size)
-
-      # Create the first bidirectional layer
-      encoder_cell = tf.contrib.rnn.EmbeddingWrapper(
-          single_cell,
-          embedding_classes=source_vocab_size,
-          embedding_size=size)
-      encoder_outputs, s_fw, s_bw = tf.contrib.rnn.static_bidirectional_rnn(
-          encoder_cell, encoder_cell, encoder_inputs, dtype=dtype)
-      encoder_state = s_fw
-
-      # Create remaining regular layer for multiple layer network.
-      if num_layers > 1:
-        encoder_cell = tf.contrib.rnn.MultiRNNCell([single_cell] * (num_layers - 1))
-        encoder_outputs, encoder_state_uni = tf.contrib.rnn.static_rnn(
-            encoder_cell, encoder_outputs, dtype=dtype)
-        encoder_state = (encoder_state, ) + encoder_state_uni
-  
-      # First calculate a concatenation of encoder outputs to put attention on.
-      top_states = [
-          tf.reshape(e, [-1, 1, encoder_cell.output_size]) for e in encoder_outputs
-      ]
-      attention_states = tf.concat(top_states, 1)
-  
-      # Decoder.
-      output_size = None
-      decoder_cell = single_cell
-      if num_layers > 1:
-        decoder_cell = tf.contrib.rnn.MultiRNNCell([single_cell] * num_layers)
-      if output_projection is None:
-        decoder_cell = tf.contrib.rnn.OutputProjectionWrapper(
-            decoder_cell, target_vocab_size)
-        output_size = target_vocab_size
-  
-      return tf.contrib.legacy_seq2seq.embedding_attention_decoder(
-          decoder_inputs,
-          encoder_state,
-          attention_states,
-          decoder_cell,
-          target_vocab_size,
-          size,
-          num_heads=1,
-          output_size=output_size,
-          output_projection=output_projection,
-          feed_previous=do_decode,
-          initial_state_attention=False)
 
     # Feeds for inputs.
     self.encoder_inputs = []
@@ -191,20 +144,21 @@ class Seq2SeqModel(object):
     if forward_only:
       self.outputs, self.losses = tf.contrib.legacy_seq2seq.model_with_buckets(
           self.encoder_inputs, self.decoder_inputs, targets,
-          self.target_weights, buckets, lambda x, y: seq2seq_f(x, y, True),
+          self.target_weights, buckets, lambda x, y: self.seq2seq_f(x, y, True),
           softmax_loss_function=softmax_loss_function)
       # If we use output projection, we need to project outputs for decoding.
-      if output_projection is not None:
+      if self.output_projection is not None:
         for b in xrange(len(buckets)):
           self.outputs[b] = [
-              tf.matmul(output, output_projection[0]) + output_projection[1]
+              tf.matmul(output, self.output_projection[0])
+                  + self.output_projection[1]
               for output in self.outputs[b]
           ]
     else:
       self.outputs, self.losses = tf.contrib.legacy_seq2seq.model_with_buckets(
           self.encoder_inputs, self.decoder_inputs, targets,
           self.target_weights, buckets,
-          lambda x, y: seq2seq_f(x, y, False),
+          lambda x, y: self.seq2seq_f(x, y, False),
           softmax_loss_function=softmax_loss_function)
 
     # Gradients and SGD update operation for training the model.
@@ -222,6 +176,78 @@ class Seq2SeqModel(object):
             zip(clipped_gradients, params), global_step=self.global_step))
 
     self.saver = tf.train.Saver(tf.global_variables())
+
+  # The _seq2seq function: we use embedding for the input and attention.
+  def seq2seq_f(self, encoder_inputs, decoder_inputs, do_decode):
+    encoder_state = []
+    single_cell = tf.contrib.rnn.LSTMCell(self.cell_size)
+    # Create the first bidirectional layer
+    with tf.variable_scope("cell_0"):
+      if self.num_gpus == 0:
+        device = "/cpu:0"
+      else:
+        device = "/gpu:0"
+      embedding_cell = tf.contrib.rnn.EmbeddingWrapper(
+          cells.DeviceWrapper(single_cell, device),
+          embedding_classes=self.source_vocab_size,
+          embedding_size=self.cell_size)
+      encoder_outputs, fw, bw = tf.contrib.rnn.static_bidirectional_rnn(
+          embedding_cell,
+          embedding_cell,
+          encoder_inputs,
+          dtype=self.dtype)
+      encoder_state.append(map(tf.add, fw, bw))
+
+    # Create remaining regular layer for multiple layer network.
+    if self.num_layers > 1:
+      if self.num_gpus == 0:
+        encoder_cell_list = [single_cell] * (self.num_layers - 1)
+      else:
+        encoder_cell_list = [
+            cells.DeviceWrapper(single_cell, "/gpu:%d" % (i % self.num_gpus))
+            for i in range(1, self.num_layers)
+        ]
+      encoder_cell = cells.ResidualMultiRNNCell(encoder_cell_list)
+      encoder_outputs, fw = tf.contrib.rnn.static_rnn(
+          encoder_cell,
+          encoder_outputs,
+          dtype=self.dtype)
+      encoder_state.extend(fw)
+
+    # First calculate a concatenation of encoder outputs to put attention on.
+    top_states = [
+        tf.reshape(e, [-1, 1, self.cell_size]) for e in encoder_outputs
+    ]
+    attention_states = tf.concat(top_states, 1)
+
+    # Decoder.
+    if self.num_gpus == 0:
+      decoder_cell_list = [single_cell] * self.num_layers
+    else:
+      decoder_cell_list = [
+          cells.DeviceWrapper(single_cell, "/gpu:%d" % (i % self.num_gpus))
+          for i in range(0, self.num_layers)
+      ]
+    decoder_cell = cells.ResidualMultiRNNCell(decoder_cell_list)
+
+    output_size = None
+    if self.output_projection is None:
+      decoder_cell = tf.contrib.rnn.OutputProjectionWrapper(
+          decoder_cell, self.target_vocab_size)
+      output_size = self.target_vocab_size
+
+    return tf.contrib.legacy_seq2seq.embedding_attention_decoder(
+        decoder_inputs,
+        encoder_state,
+        attention_states,
+        decoder_cell,
+        self.target_vocab_size,
+        self.cell_size,
+        num_heads=1,
+        output_size=output_size,
+        output_projection=self.output_projection,
+        feed_previous=do_decode,
+        initial_state_attention=False)
 
   def step(self, session, encoder_inputs, decoder_inputs, target_weights,
            bucket_id, forward_only):

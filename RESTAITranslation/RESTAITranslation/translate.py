@@ -54,12 +54,13 @@ tf.app.flags.DEFINE_float("max_gradient_norm", 5.0,
 tf.app.flags.DEFINE_integer("batch_size", 64,
                             "Batch size to use during training.")
 tf.app.flags.DEFINE_integer("size", 1024, "Size of each model layer.")
-tf.app.flags.DEFINE_integer("num_layers", 3, "Number of layers in the model.")
+tf.app.flags.DEFINE_integer("num_layers", 4, "Number of layers in the model.")
+tf.app.flags.DEFINE_integer("num_gpus", 0, "Number of layers in the model.")
 tf.app.flags.DEFINE_integer("en_vocab_size", 40000, "English vocabulary size.")
 tf.app.flags.DEFINE_integer("cn_vocab_size", 40000, "Chinese vocabulary size.")
-tf.app.flags.DEFINE_string("train_path", "/data/tv/HouseOfCard", "Training data name")
-tf.app.flags.DEFINE_string("dev_path", "/data/tv/GameOfThrones", "Development data name")
-tf.app.flags.DEFINE_string("train_dir", "/data/trained_models", "Training directory.")
+tf.app.flags.DEFINE_string("train_path", "/home/ubuntu/data/tv/HouseOfCard", "Training data name")
+tf.app.flags.DEFINE_string("dev_path", "/home/ubuntu/data/tv/GameOfThrones", "Development data name")
+tf.app.flags.DEFINE_string("train_dir", "/data/trained_models/lstm", "Training directory.")
 tf.app.flags.DEFINE_integer("max_train_data_size", 0,
                             "Limit on the size of training data (0: no limit).")
 tf.app.flags.DEFINE_integer("steps_per_checkpoint", 200,
@@ -79,8 +80,8 @@ _buckets = [(5, 10), (10, 15), (20, 25), (40, 50)]
 
 sess = None
 model = None
-en_vocab_path = None                
-cn_vocab_path = None                
+en_vocab_path = None
+cn_vocab_path = None
 en_vocab = None
 rev_cn_vocab = None
 
@@ -103,10 +104,10 @@ def read_data(source_path, target_path, max_size=None):
       len(target) < _buckets[n][1]; source and target are lists of token-ids.
   """
   data_set = [[] for _ in _buckets]
+  counter = 0
   with tf.gfile.GFile(source_path, mode="r") as source_file:
     with tf.gfile.GFile(target_path, mode="r") as target_file:
       source, target = source_file.readline(), target_file.readline()
-      counter = 0
       while source and target and (not max_size or counter < max_size):
         counter += 1
         if counter % 100000 == 0:
@@ -120,7 +121,7 @@ def read_data(source_path, target_path, max_size=None):
             data_set[bucket_id].append([source_ids, target_ids])
             break
         source, target = source_file.readline(), target_file.readline()
-  return data_set
+  return (data_set, counter)
 
 
 def create_model(session, forward_only):
@@ -132,11 +133,11 @@ def create_model(session, forward_only):
       _buckets,
       FLAGS.size,
       FLAGS.num_layers,
+      FLAGS.num_gpus,
       FLAGS.max_gradient_norm,
       FLAGS.batch_size,
       FLAGS.learning_rate,
       FLAGS.learning_rate_decay_factor,
-      use_lstm=True,
       forward_only=forward_only,
       dtype=dtype)
   ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
@@ -154,7 +155,9 @@ def train():
   en_train, cn_train, en_dev, cn_dev, _, _ = data_utils.prepare_data(
       FLAGS.train_path, FLAGS.dev_path, FLAGS.en_vocab_size, FLAGS.cn_vocab_size)
 
-  with tf.Session() as sess:
+  with tf.Session(config=tf.ConfigProto(
+      allow_soft_placement=True,
+      log_device_placement=False)) as sess:
     # Create model.
     print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.size))
     model = create_model(sess, False)
@@ -162,8 +165,8 @@ def train():
     # Read data into buckets and compute their sizes.
     print ("Reading development and training data (limit: %d)."
            % FLAGS.max_train_data_size)
-    dev_set = read_data(en_dev, cn_dev)
-    train_set = read_data(en_train, cn_train, FLAGS.max_train_data_size)
+    dev_set, _ = read_data(en_dev, cn_dev)
+    train_set, total_line = read_data(en_train, cn_train, FLAGS.max_train_data_size)
     train_bucket_sizes = [len(train_set[b]) for b in xrange(len(_buckets))]
     train_total_size = float(sum(train_bucket_sizes))
 
@@ -177,7 +180,8 @@ def train():
     step_time, loss = 0.0, 0.0
     current_step = 0
     previous_losses = []
-    while True:
+    total_steps = total_line / FLAGS.batch_size
+    while current_step < total_steps:
       # Choose a bucket according to data distribution. We pick a random number
       # in [0, 1] and use the corresponding interval in train_buckets_scale.
       random_number_01 = np.random.random_sample()
@@ -223,6 +227,7 @@ def train():
           print("  eval: bucket %d perplexity %.2f" % (bucket_id, eval_ppx))
         sys.stdout.flush()
 
+
 def decode(originalText):
       global sess
       global model
@@ -231,7 +236,7 @@ def decode(originalText):
       global en_vocab
       global rev_cn_vocab
 
-      if model is None:              
+      if model is None:
         # Create model and load parameters.
         sess = tf.Session()
         model = create_model(sess, True)
@@ -255,7 +260,7 @@ def decode(originalText):
 
       # Get a 1-element batch to feed the originalText to the model.
       encoder_inputs, decoder_inputs, target_weights = model.get_batch(
-          {bucket_id: [(token_ids, [])]}, bucket_id)           
+          {bucket_id: [(token_ids, [])]}, bucket_id)
       # Get output logits for the originalText.
       _, _, output_logits = model.step(sess, encoder_inputs, decoder_inputs,
                                       target_weights, bucket_id, True)
@@ -289,16 +294,13 @@ def self_test():
                  bucket_id, False)
 
 
-# def main():
-  
-#   if FLAGS.self_test:
-#     self_test()
-#   elif FLAGS.decode:
-#     decode("how are you")
-#     # decode("how is the whether")
-#   else:
-#     train()
+def main(_):
+  if FLAGS.self_test:
+    self_test()
+  elif FLAGS.decode:
+    decode()
+  else:
+    train()
 
-# decode("how are you")
-# if __name__ == "__main__":
-#   tf.app.run()
+if __name__ == "__main__":
+  tf.app.run()

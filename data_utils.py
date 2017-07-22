@@ -43,6 +43,7 @@ UNK_ID = 3
 # Regular expressions used to tokenize.
 _WORD_SPLIT = re.compile(b"([.,!?\"':;)(])")
 _DIGIT_RE = re.compile(br"\d")
+_MIX_SPLIT = re.compile(ur"[\w\d]+|-+|[\u4e00-\ufaff]|[^\s]")
 
 
 def basic_decoder(sentence):
@@ -56,11 +57,11 @@ def basic_tokenizer(sentence):
   words = []
   for space_separated_fragment in sentence.split():
     words.extend(_WORD_SPLIT.split(space_separated_fragment))
-  return [w for w in words if w]
+  return [w.lower() for w in words if w]
 
 def chinese_tokenizer(sentence):
   """Simplest tokenizer for Chinese: split the sentence into characters."""
-  return list(sentence)
+  return _MIX_SPLIT.findall(sentence)
 
 def create_vocabulary(vocabulary_path, train_path, dev_path, max_vocabulary_size, decoder,
                       tokenizer, normalize_digits=True):
